@@ -170,7 +170,7 @@
 
             <!-- 결과 표시 섹션 -->
             <section>
-                <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-t pt-6 mt-6">📊 계산 결과</h2>
+                <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-t pt-6 mt-6">📊 계산 결과 (최단 거리)</h2>
                 <div id="results-table-container" class="overflow-x-auto rounded-lg shadow-inner">
                     <table id="results-table" class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
@@ -180,12 +180,11 @@
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">거주지 주소</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">가장 가까운 학교명</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">최단 거리 (km)</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">상태</th>
                             </tr>
                         </thead>
                         <tbody id="results-body" class="bg-white divide-y divide-gray-200">
                             <!-- 결과 행이 여기에 삽입됩니다. -->
-                            <tr><td colspan="6" class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">데이터를 입력하고 계산 버튼을 눌러주세요.</td></tr>
+                            <tr><td colspan="5" class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">데이터를 입력하고 계산 버튼을 눌러주세요.</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -352,7 +351,8 @@
                         throw error;
                     }
                     const delay = initialDelay * Math.pow(2, attempt) + Math.random() * 1000;
-                    console.warn(`API 호출 실패 (시도 ${attempt + 1}/${maxRetries}). ${Math.round(delay/1000)}초 후 재시도...`, error);
+                    // API 호출 실패 시 콘솔 로깅은 유지
+                    // console.warn(`API 호출 실패 (시도 ${attempt + 1}/${maxRetries}). ${Math.round(delay/1000)}초 후 재시도...`, error);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
@@ -393,10 +393,137 @@
             });
         }
 
+        // 병렬 처리를 위한 배치 계산 함수 (최적화: 중간 UI 업데이트 제거)
+        async function calculateDistanceBatches(residences, schools, getCachedCoordinates) {
+            const MAX_CONCURRENT_API_CALLS = 5; // 동시 API 호출 제한
+            const totalTasks = residences.length * schools.length;
+            let completedTasks = 0;
+            const closestSchoolMap = new Map();
+
+            // 모든 거주지와 학교 쌍을 작업 목록으로 생성
+            const tasks = [];
+            for (const residence of residences) {
+                for (const school of schools) {
+                    tasks.push({ residence, school });
+                }
+            }
+
+            // 작업을 일괄 처리할 청크 사이즈 결정 (최대 동시 호출 건수)
+            const chunkSize = MAX_CONCURRENT_API_CALLS; 
+
+            for (let i = 0; i < tasks.length; i += chunkSize) {
+                const chunk = tasks.slice(i, i + chunkSize);
+                const chunkPromises = chunk.map(task => 
+                    (async () => {
+                        const { residence, school } = task;
+                        let residenceName = residence.Name;
+                        
+                        let currentBestResult = closestSchoolMap.get(residenceName) || {
+                            residenceName: residenceName,
+                            residenceAddress: residence.Address,
+                            closestSchool: { name: 'N/A', address: 'N/A' },
+                            minDistanceKm: Infinity,
+                            status: '처리 중'
+                        };
+
+                        try {
+                            const residenceCoords = await getCachedCoordinates(residence.Address);
+                            if (!residenceCoords) throw new Error("거주지 주소 변환 불가");
+                            
+                            const schoolCoords = await getCachedCoordinates(school.SchoolAddress);
+                            if (!schoolCoords) throw new Error(`학교 (${school.SchoolName}) 주소 변환 불가`);
+
+                            const schoolDistanceKm = await getDrivingDistance(residenceCoords, schoolCoords);
+
+                            // 현재 계산된 거리가 해당 거주지의 최단 거리보다 짧으면 업데이트
+                            if (schoolDistanceKm < currentBestResult.minDistanceKm) {
+                                currentBestResult.minDistanceKm = schoolDistanceKm;
+                                currentBestResult.closestSchool = {
+                                    name: school.SchoolName,
+                                    address: school.SchoolAddress
+                                };
+                                currentBestResult.status = '최단 거리 업데이트';
+                            }
+
+                        } catch (e) {
+                            if (e.message === "API_NOT_ACTIVATED") throw e;
+                            
+                            // Geocoding 오류이거나 Directions 오류일 경우, 현재 학교와의 계산만 실패로 처리하고 계속 진행
+                            if (e.message.includes('거주지 주소 변환 불가') && currentBestResult.status === '처리 중') {
+                                currentBestResult.status = `거주지 오류: ${e.message.substring(13)}`; // 오류 메시지 축약
+                            } else if (e.message.includes('학교') || e.message.includes('Directions API 오류')) {
+                                // 학교별 오류는 최단 거리 갱신에 영향을 주지 않으므로 상태를 변경하지 않음
+                            } else {
+                                console.error(`Unexpected error for ${residence.Name}: ${e.message}`);
+                            }
+                        } finally {
+                            completedTasks++;
+                            // 매번 최단 결과를 맵에 저장
+                            closestSchoolMap.set(residenceName, currentBestResult); 
+                            
+                            // UI 업데이트를 매 배치마다 하지 않고, 상태 메시지만 업데이트하여 속도 개선
+                            if (completedTasks % chunkSize === 0 || completedTasks === totalTasks) {
+                                showStatus(`처리 중: ${completedTasks}/${totalTasks} 건 완료 (${Math.floor((completedTasks / totalTasks) * 100)}%)`, 'info');
+                            }
+                        }
+                    })()
+                );
+                // 현재 청크의 모든 Promise가 완료될 때까지 기다립니다.
+                try {
+                    await Promise.all(chunkPromises);
+                } catch (e) {
+                    if (e.message === "API_NOT_ACTIVATED") throw e;
+                    console.error("Batch error detected, continuing to next batch if possible.");
+                }
+            }
+
+            return Array.from(closestSchoolMap.values());
+        }
+
+        // 결과 테이블을 업데이트하는 함수 (최소 필드만 남기고 '상태' 제거)
+        function updateResultsTable(closestSchoolMap) {
+            resultsBody.innerHTML = '';
+            resultsData = [];
+            let finalIndex = 0;
+
+            for (const [name, result] of closestSchoolMap.entries()) {
+                finalIndex++;
+                
+                const isSuccess = result.minDistanceKm !== Infinity; 
+                const distanceDisplay = isSuccess ? `${result.minDistanceKm.toFixed(2)} km` : 'N/A';
+                const statusDisplay = isSuccess ? '성공 (최단 거리 확인)' : (result.status === '처리 중' ? '모든 학교 계산 실패' : result.status);
+                const statusColor = isSuccess ? 'text-green-600' : 'text-red-600';
+                
+                // 결과 테이블 업데이트 (최소 필드만 출력)
+                let row = resultsBody.insertRow();
+                row.classList.add(isSuccess ? 'hover:bg-green-50' : 'bg-red-50');
+                row.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${finalIndex}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900">${result.residenceName}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${result.residenceAddress}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-bold ${isSuccess ? 'text-blue-600' : 'text-gray-500'}">${result.closestSchool.name}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 font-extrabold distance-cell">${distanceDisplay}</td>
+                    <!-- '상태' 컬럼 제거됨 -->
+                `;
+
+                // 결과 데이터 저장 (다운로드용)
+                resultsData.push({
+                    No: finalIndex,
+                    Name: result.residenceName,
+                    ResidenceAddress: result.residenceAddress,
+                    ClosestSchoolName: result.closestSchool.name,
+                    ClosestSchoolAddress: result.closestSchool.address,
+                    DistanceKm: isSuccess ? result.minDistanceKm.toFixed(2) : 'N/A',
+                    Status: statusDisplay // 상태는 데이터에는 남겨두지만 테이블에는 표시하지 않음
+                });
+            }
+        }
+
+
         // ==== 메인 처리 로직 (최단 거리 계산 로직으로 변경) ====
 
         async function processCalculation() {
-            resultsBody.innerHTML = '<tr><td colspan="6" class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center text-blue-600 font-medium">데이터를 파싱하는 중...</td></tr>';
+            resultsBody.innerHTML = '<tr><td colspan="5" class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center text-blue-600 font-medium">데이터를 파싱하는 중...</td></tr>';
             downloadButton.classList.add('hidden');
             resultsData = [];
             toggleLoading(true);
@@ -418,7 +545,7 @@
                 console.error("데이터 파싱 오류:", error);
                 showStatus(`데이터 입력 오류: ${error.message}`, 'error');
                 toggleLoading(false);
-                resultsBody.innerHTML = '<tr><td colspan="6" class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center text-red-600 font-bold">계산 오류: 데이터를 확인해 주세요.</td></tr>';
+                resultsBody.innerHTML = '<tr><td colspan="5" class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center text-red-600 font-bold">계산 오류: 데이터를 확인해 주세요.</td></tr>';
                 return;
             }
 
@@ -427,125 +554,37 @@
             const getCachedCoordinates = async (address) => {
                 if (!geocodeCache.has(address)) {
                     try {
+                         // Geocoding 호출
                          geocodeCache.set(address, await getCoordinates(address));
                     } catch (e) {
                         // API_NOT_ACTIVATED 오류 재전파
                         if (e.message === "API_NOT_ACTIVATED") throw e;
                         // 다른 오류는 null로 처리하여 거리 계산을 건너뛰도록 함
                         geocodeCache.set(address, null);
-                        throw e;
+                        throw e; // Geocoding 오류 발생 시 throws
                     }
                 }
                 return geocodeCache.get(address);
             };
 
-            // 3. 최단 거리 계산 실행
-            const closestSchoolMap = new Map(); // 각 거주지별 최단 결과를 저장
-            resultsBody.innerHTML = ''; 
-
-            for (const residence of residences) {
+            // 3. 최단 거리 계산 실행 및 배치 처리
+            try {
+                const finalResults = await calculateDistanceBatches(residences, schools, getCachedCoordinates);
                 
-                let residenceBestResult = {
-                    residenceName: residence.Name,
-                    residenceAddress: residence.Address,
-                    closestSchool: { name: 'N/A', address: 'N/A' },
-                    minDistanceKm: Infinity,
-                    status: '처리 중'
-                };
-                
-                try {
-                    // 1. 거주지 좌표 (캐시 사용)
-                    const residenceCoords = await getCachedCoordinates(residence.Address);
-                    
-                    if (!residenceCoords) {
-                         throw new Error("거주지 주소 변환 불가");
-                    }
-                    
-                    // 각 거주지에 대한 모든 학교 거리를 계산하고 최솟값을 찾습니다.
-                    for (const school of schools) {
-                        
-                        try {
-                            // 2. 학교 좌표 (캐시 사용)
-                            const schoolCoords = await getCachedCoordinates(school.SchoolAddress);
-                            
-                            if (!schoolCoords) {
-                                // 해당 학교에 대한 개별 오류는 건너뜁니다.
-                                console.warn(`Skipping distance calculation for ${residence.Name} to ${school.SchoolName}: School Geocoding failed.`);
-                                continue; 
-                            }
+                // 최종 결과 테이블 업데이트 (모든 계산이 끝난 후 한 번만 실행)
+                updateResultsTable(new Map(finalResults.map(r => [r.residenceName, r])));
 
-                            // 3. 거리 계산
-                            const schoolDistanceKm = await getDrivingDistance(residenceCoords, schoolCoords);
-                            
-                            if (schoolDistanceKm < residenceBestResult.minDistanceKm) {
-                                residenceBestResult.minDistanceKm = schoolDistanceKm;
-                                residenceBestResult.closestSchool = {
-                                    name: school.SchoolName,
-                                    address: school.SchoolAddress
-                                };
-                                residenceBestResult.status = '최단 거리 업데이트';
-                            }
-                            
-                        } catch (e) {
-                            if (e.message === "API_NOT_ACTIVATED") throw e;
-                            console.error(`Error calculating distance for ${residence.Name} to ${school.SchoolName}: ${e.message}`);
-                            // 개별 학교 오류는 최단 거리 결과에 영향을 주지 않으므로 계속 진행
-                        }
-                    }
-
-                } catch (e) {
-                    if (e.message === "API_NOT_ACTIVATED") {
-                        residenceBestResult.status = "API_NOT_ACTIVATED_ERROR";
-                        throw e; 
-                    }
-                    residenceBestResult.status = `거주지 처리 오류: ${e.message}`;
-                    console.error(`Error processing residence ${residence.Name}: ${e.message}`);
+            } catch (e) {
+                if (e.message === "API_NOT_ACTIVATED") {
+                    showStatus('치명적 오류: Geocoding/Directions API가 활성화되지 않았습니다. 콘솔을 확인하세요.', 'error');
+                } else {
+                    showStatus(`계산 중 치명적 오류 발생: ${e.message}`, 'error');
+                    console.error("Critical error during calculation:", e);
                 }
-                
-                // 해당 거주지에 대한 최종 결과 저장
-                closestSchoolMap.set(residence.Name, residenceBestResult);
-
-                // 실시간 상태 업데이트 (현재 처리 중인 거주지 표시)
-                showStatus(`처리 완료: ${residence.Name}의 최단 거리 확인됨.`, 'info');
+                toggleLoading(false);
+                return;
             }
             
-            // 4. 최종 결과 출력 및 데이터 정리
-            resultsBody.innerHTML = '';
-            resultsData = [];
-            let finalIndex = 0;
-
-            for (const [name, result] of closestSchoolMap.entries()) {
-                finalIndex++;
-                
-                const isSuccess = result.minDistanceKm !== Infinity; 
-                const distanceDisplay = isSuccess ? `${result.minDistanceKm.toFixed(2)} km` : 'N/A';
-                const statusDisplay = isSuccess ? '성공 (최단 거리 확인)' : (result.status === '처리 중' ? '모든 학교 계산 실패' : result.status);
-                const statusColor = isSuccess ? 'text-green-600' : 'text-red-600';
-                
-                // 결과 테이블 업데이트
-                let row = resultsBody.insertRow();
-                row.classList.add(isSuccess ? 'hover:bg-green-50' : 'bg-red-50');
-                row.innerHTML = `
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${finalIndex}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900">${result.residenceName}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${result.residenceAddress}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-bold ${isSuccess ? 'text-blue-600' : 'text-gray-500'}">${result.closestSchool.name}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 font-extrabold distance-cell">${distanceDisplay}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${statusColor} status-cell">${statusDisplay}</td>
-                `;
-
-                // 결과 데이터 저장 (다운로드용)
-                resultsData.push({
-                    No: finalIndex,
-                    Name: result.residenceName,
-                    ResidenceAddress: result.residenceAddress,
-                    ClosestSchoolName: result.closestSchool.name,
-                    ClosestSchoolAddress: result.closestSchool.address,
-                    DistanceKm: isSuccess ? result.minDistanceKm.toFixed(2) : 'N/A',
-                    Status: statusDisplay
-                });
-            }
-
             toggleLoading(false);
             showStatus('모든 거주지별 최단 거리 계산이 완료되었습니다!', 'success');
             downloadButton.classList.remove('hidden');
@@ -555,7 +594,7 @@
         function downloadCSV() {
             if (resultsData.length === 0) return;
 
-            // CSV 헤더 변경: 학교명이 '가장 가까운 학교명'으로 바뀜
+            // CSV 헤더: 가장 가까운 학교 정보를 포함하도록 구성
             let csvContent = "No.,성명,거주지 주소,가장 가까운 학교명,가장 가까운 학교 주소,최단 거리 (km),상태\n";
             resultsData.forEach(row => {
                 const rowArray = [
